@@ -98,6 +98,30 @@ running_procs = {}
 server_states = {}
 lock = threading.Lock()
 
+# Bolt: per-path cache of server.log contents, keyed on mtime+size so reads are
+# skipped when the file is unchanged (append-only logs). Bounded by the number of
+# servers and by MAX_LOG_SIZE (logs are truncated to ~1MB by truncate_large_logs).
+_log_cache = {}
+
+
+def read_server_log(path):
+    try:
+        st = os.stat(path)
+        entry = _log_cache.get(path)
+        # The dashboard console polls /server/stats every 2s and we return the full
+        # log each time, so an unchanged appending log used to be re-read on every
+        # poll (~3.5ms for a 1.4MB read every 2s). Skip the disk read when possible.
+        if entry and entry["mtime"] == st.st_mtime and entry["size"] == st.st_size:
+            return entry["data"]
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            data = f.read()
+        _log_cache[path] = {"mtime": st.st_mtime, "size": st.st_size, "data": data}
+        return data
+    except FileNotFoundError:
+        return ""
+    except Exception:
+        return ""
+
 
 def get_ip():
     try:
@@ -992,10 +1016,8 @@ def server_stats(key):
                 pass
 
     log_path = os.path.join(server_dir, "server.log")
-    try:
-        logs = open(log_path, "r", encoding="utf-8", errors="ignore").read() if os.path.exists(log_path) else ""
-    except Exception:
-        logs = ""
+    # Bolt: cached read - unchanged logs skip re-reading on every 2s poll.
+    logs = read_server_log(log_path)
 
     state = get_state(key)
     if meta.get("banned", False):
