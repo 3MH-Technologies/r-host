@@ -7,22 +7,26 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     curl \
     git \
+    util-linux \
     && rm -rf /var/lib/apt/lists/*
 
-RUN useradd -m -u 1000 user
-USER user
-ENV PATH="/home/user/.local/bin:$PATH"
+# Zero-trust: the panel runs as root so it can create a dedicated OS user per
+# bot and demote every bot process into it (useradd + prlimit). Bots themselves
+# never run as root. Keep util-linux installed for prlimit (rlimits).
+RUN useradd -r -M -s /usr/sbin/nologin panel || true
+
+ENV PATH="/usr/local/bin:/usr/bin:/bin"
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
 
 WORKDIR /app
 
-COPY --chown=user requirements.txt .
+COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade -r requirements.txt
 
-COPY --chown=user . .
+COPY . .
 
 ENV SERVER_PORT=7860
-ENV PYTHONUNBUFFERED=1
-ENV PYTHONDONTWRITEBYTECODE=1
 EXPOSE 7860
 
 CMD ["python", "app.py"]

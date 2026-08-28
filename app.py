@@ -19,6 +19,11 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 from functools import wraps
 from collections import defaultdict
 
+try:
+    import pwd as _pwd
+except ImportError:
+    _pwd = None
+
 ai_client = None
 
 def get_ai_client():
@@ -107,10 +112,154 @@ running_procs = {}
 server_states = {}
 lock = threading.Lock()
 
+# ===== Zero-Trust OS user isolation =====================================
+# Every bot runs as its OWN Unix account (bot_<hash>), so a compromised bot:
+#  - cannot read DATA/users.json (panel data) or other owners' USERS/ dirs,
+#  - cannot read host secrets, runs with the least privilege (no shell, no home),
+#  - only its own server dir is writable by it (0700, owned by the bot user).
+ISOLATION_ENABLED = os.environ.get("BOT_ISOLATION", "1").lower() not in ("0", "off", "no", "false")
+
+
+# These env vars would let bot code interfere with the interpreter or the host.
+_ISOLATION_ENV_DENY = {
+    "PYTHONPATH", "PYTHONHOME", "LD_PRELOAD", "LD_LIBRARY_PATH",
+    "PYTHONSTARTUP", "BASH_ENV", "ENV", "IFS", "SHELLOPTS",
+}
+
+
+def _is_posix_root():
+    if os.name != "posix":
+        return False
+    try:
+        return os.geteuid() == 0
+    except (AttributeError, OSError):
+        return False
+
+
+def _bot_user_name(owner, folder):
+    digest = hashlib.sha256(f"{owner}::{folder}".encode("utf-8")).hexdigest()[:12]
+    return f"bot_{digest}"
+
+
+def _bot_user_info(owner, folder):
+    """Return (uid, gid) for the bot's dedicated OS user, creating it if needed.
+    Returns (None, None) when OS isolation is unavailable (non-root / non-POSIX)."""
+    if not ISOLATION_ENABLED or not _is_posix_root():
+        return None, None
+    name = _bot_user_name(owner, folder)
+    try:
+        entry = _pwd.getpwnam(name)
+        return entry.pw_uid, entry.pw_gid
+    except KeyError:
+        pass
+    try:
+        subprocess.run(
+            ["useradd", "-M", "-s", "/usr/sbin/nologin", "-N", name],
+            check=True, capture_output=True, timeout=30,
+        )
+        entry = _pwd.getpwnam(name)
+        return entry.pw_uid, entry.pw_gid
+    except Exception as e:
+        logger.warning(f"Isolation: could not create OS user for {owner}::{folder}: {e}")
+        return None, None
+
+
+def _chown_recursive(path, uid, gid):
+    for _root, dirs, files in os.walk(path):
+        for d in dirs:
+            try:
+                os.chown(os.path.join(_root, d), uid, gid)
+            except OSError:
+                pass
+        for f in files:
+            try:
+                os.chown(os.path.join(_root, f), uid, gid)
+            except OSError:
+                pass
+    try:
+        os.chown(path, uid, gid)
+    except OSError:
+        pass
+
+
+def _bot_chown(owner, folder, path):
+    """Hand a panel-created file back to the bot's dedicated OS user so the bot
+    can keep editing it. No-op when isolation is off."""
+    if not ISOLATION_ENABLED or not _is_posix_root():
+        return
+    uid, gid = _bot_user_info(owner, folder)
+    if uid is None:
+        return
+    try:
+        os.chown(path, uid, gid)
+        os.chmod(path, 0o644)
+    except OSError:
+        pass
+
+
+def _harden_zone(owner, folder):
+    """Give the bot's server dir to its dedicated user; lock panel data away.
+    No-op when isolation is disabled or when not running as POSIX root."""
+    if not ISOLATION_ENABLED or not _is_posix_root():
+        return
+    uid, gid = _bot_user_info(owner, folder)
+    if uid is None:
+        return
+    server_dir = get_server_dir(owner, folder)
+    if os.path.isdir(server_dir):
+        _chown_recursive(server_dir, uid, gid)
+        try:
+            os.chmod(server_dir, 0o700)
+        except OSError:
+            pass
+    # Panel data: no one but root may even traverse into DATA/.
+    try:
+        os.chmod(DATA_DIR, 0o700)
+    except OSError:
+        pass
+    # Bot only needs to reach its OWN dir: traverse (x) is enough on the parents,
+    # list (r) off. Its own server dir above is 0700, so other bots can't read in.
+    for d in (USERS_ROOT, get_user_servers_root(owner)):
+        try:
+            os.chmod(d, 0o711)
+        except OSError:
+            pass
+
+
+def _apply_rlimits(pid, mem_mb):
+    """Cap the running bot with prlimit (root only). Run AFTER fork/exec so no
+    preexec_fn thread-safety hazards: bounds memory, process/thread count, open
+    files, core dumps and single-file size for the whole process tree."""
+    if not _is_posix_root():
+        return
+    try:
+        subprocess.run(
+            [
+                "prlimit", "--pid", str(pid),
+                f"--as={int(mem_mb) * 1024 * 1024}",
+                "--nproc=256",
+                "--nofile=512",
+                "--core=0",
+                f"--fsize={2 * 1024 * 1024 * 1024}",
+            ],
+            check=True, capture_output=True, timeout=15,
+        )
+    except Exception:
+        pass
+
 # Bolt: per-path cache of server.log contents, keyed on mtime+size so reads are
 # skipped when the file is unchanged (append-only logs). Bounded by the number of
 # servers and by MAX_LOG_SIZE (logs are truncated to ~1MB by truncate_large_logs).
 _log_cache = {}
+
+
+def safe_open_read(path):
+    """Open for reading with O_NOFOLLOW (ELOOP => return None)."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        return os.fdopen(fd, "r", encoding="utf-8", errors="ignore")
+    except OSError:
+        return None
 
 
 def read_server_log(path):
@@ -122,7 +271,10 @@ def read_server_log(path):
         # poll (~3.5ms for a 1.4MB read every 2s). Skip the disk read when possible.
         if entry and entry["mtime"] == st.st_mtime and entry["size"] == st.st_size:
             return entry["data"]
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        f = safe_open_read(path)
+        if f is None:
+            return ""
+        with f:
             data = f.read()
         _log_cache[path] = {"mtime": st.st_mtime, "size": st.st_size, "data": data}
         return data
@@ -177,7 +329,7 @@ def log_append(key, text):
             owner = current_username()
             folder = key
         p = os.path.join(get_server_dir(owner, folder), "server.log")
-        with open(p, "a", encoding="utf-8", errors="ignore") as f:
+        with safe_open_write(p, "a") as f:
             f.write(text)
     except Exception:
         pass
@@ -214,6 +366,12 @@ def save_users(db):
     tmp = USERS_DB + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(db, f, indent=2)
+    if _is_posix_root():
+        try:
+            os.chmod(tmp, 0o600)
+            os.chmod(USERS_DB, 0o600)
+        except OSError:
+            pass
     os.replace(tmp, USERS_DB)
 
 
@@ -259,6 +417,11 @@ def load_ads():
 def save_ads(data):
     with open(ADS_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
+    if _is_posix_root():
+        try:
+            os.chmod(ADS_FILE, 0o600)
+        except OSError:
+            pass
 
 
 BOT_RENEW_DAYS = 4
@@ -371,7 +534,65 @@ def safe_join_server_path(key, rel_path=""):
     joined = os.path.abspath(os.path.join(root, rel_path))
     if not (joined == root or joined.startswith(root + os.sep)):
         raise ValueError("Invalid path")
+    # Zero-trust: a bot owns its dir and could plant symlinks pointing outside
+    # (e.g. to DATA/users.json or /etc files). Resolve real paths so read/write
+    # can never escape the server dir, even via nested symlinks.
+    real_root = os.path.realpath(root)
+    real_joined = os.path.realpath(joined)
+    if not (real_joined == real_root or real_joined.startswith(real_root + os.sep)):
+        raise ValueError("Invalid path")
     return joined
+
+
+def _no_follow_flag():
+    return getattr(os, "O_NOFOLLOW", 0)
+
+
+def _is_eloop_err(e):
+    return _no_follow_flag() and getattr(e, "errno", None) == getattr(os, "ELOOP", 62)
+
+
+def safe_open_write(path, mode="w"):
+    """Open for writing with O_NOFOLLOW so a planted symlink can't redirect the
+    root panel into clobbering a host file (e.g. meta.json -> /etc/passwd).
+    Binary-safe: pass mode="wb" / "ab" for uploads. On platforms without
+    O_NOFOLLOW (e.g. Windows) falls back to a plain open; OS isolation is not
+    available there anyway."""
+    binary = "b" in mode
+    text_mode = mode.replace("b", "")
+    nf = _no_follow_flag()
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | nf
+        if "a" in text_mode:
+            flags |= os.O_APPEND
+        else:
+            flags |= os.O_TRUNC
+        fd = os.open(path, flags, 0o644)
+        if binary:
+            return os.fdopen(fd, text_mode + "b")
+        return os.fdopen(fd, text_mode, encoding="utf-8", errors="ignore")
+    except OSError as e:
+        if _is_eloop_err(e):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+            fd = os.open(path, flags, 0o644)
+            if binary:
+                return os.fdopen(fd, "wb")
+            return os.fdopen(fd, "w", encoding="utf-8", errors="ignore")
+        raise
+
+
+def safe_open_read(path):
+    """Open for reading with O_NOFOLLOW where supported (ELOOP => return None)."""
+    nf = _no_follow_flag()
+    try:
+        fd = os.open(path, os.O_RDONLY | nf)
+        return os.fdopen(fd, "r", encoding="utf-8", errors="ignore")
+    except OSError:
+        return None
 
 
 def ensure_meta(owner, folder):
@@ -386,14 +607,17 @@ def ensure_meta(owner, folder):
         "last_renewed": time.time()
     }
     if not os.path.exists(meta_path):
-        with open(meta_path, "w", encoding="utf-8") as f:
+        with safe_open_write(meta_path, "w") as f:
             json.dump(base, f, indent=2)
     else:
-        try:
-            with open(meta_path, "r", encoding="utf-8") as f:
-                m = json.load(f) or {}
-        except Exception:
-            m = {}
+        rb = safe_open_read(meta_path)
+        m = {}
+        if rb is not None:
+            try:
+                with rb:
+                    m = json.load(rb) or {}
+            except Exception:
+                m = {}
         changed = False
         for k, v in base.items():
             if k not in m:
@@ -403,29 +627,32 @@ def ensure_meta(owner, folder):
             m["owner"] = owner
             changed = True
         if changed:
-            with open(meta_path, "w", encoding="utf-8") as f:
+            with safe_open_write(meta_path, "w") as f:
                 json.dump(m, f, indent=2)
     return meta_path
 
 
 def read_meta(owner, folder):
     meta_path = ensure_meta(owner, folder)
+    rb = safe_open_read(meta_path)
+    if rb is None:
+        return {"display_name": folder, "startup_file": "", "owner": owner, "banned": False}
     try:
-        with open(meta_path, "r", encoding="utf-8") as f:
-            return json.load(f) or {}
+        with rb:
+            return json.load(rb) or {}
     except Exception:
         return {"display_name": folder, "startup_file": "", "owner": owner, "banned": False}
 
 
 def write_meta(owner, folder, meta):
     meta_path = ensure_meta(owner, folder)
-    with open(meta_path, "w", encoding="utf-8") as f:
+    with safe_open_write(meta_path, "w") as f:
         json.dump(meta, f, indent=2)
 
 
 def sha256_file(path):
     h = hashlib.sha256()
-    with open(path, "rb") as f:
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW), "rb") as f:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
@@ -440,8 +667,11 @@ def read_installed(owner, folder):
     data = {"req_sha": "", "pkgs": set()}
     if not os.path.exists(p):
         return data
+    f = safe_open_read(p)
+    if f is None:
+        return data
     try:
-        with open(p, "r", encoding="utf-8", errors="ignore") as f:
+        with f:
             for line in f.read().splitlines():
                 line = line.strip()
                 if not line:
@@ -466,8 +696,9 @@ def write_installed(owner, folder, req_sha=None, add_pkgs=None):
     if cur["req_sha"]:
         lines.append(f"REQ_SHA={cur['req_sha']}")
     lines.extend(sorted(cur["pkgs"]))
-    with open(p, "w", encoding="utf-8") as f:
+    with safe_open_write(p, "w") as f:
         f.write("\n".join(lines) + ("\n" if lines else ""))
+    _bot_chown(owner, folder, p)
 
 
 def ensure_requirements_installed(owner, folder):
@@ -481,7 +712,20 @@ def ensure_requirements_installed(owner, folder):
         return False
     log_append(f"{owner}::{folder}", "[SYSTEM] Installing requirements.txt...\n")
     try:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"], cwd=server_dir)
+        # Zero-trust: requirements installs run DEMOTED to the bot's OS user with
+        # --user. A malicious setup.py in a bot's requirements.txt must never run
+        # as root / the panel user.
+        uid, gid = _bot_user_info(owner, folder)
+        iso_kwargs = {}
+        if uid is not None:
+            _harden_zone(owner, folder)
+            iso_kwargs = {"user": uid, "group": gid, "extra_groups": [], "start_new_session": True}
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "--user", "-r", "requirements.txt"],
+            cwd=server_dir,
+            env=get_subprocess_env(server_dir),
+            **iso_kwargs,
+        )
         write_installed(owner, folder, req_sha=req_sha)
         log_append(f"{owner}::{folder}", "[SYSTEM] Requirements installed\n")
         return True
@@ -493,13 +737,19 @@ def ensure_requirements_installed(owner, folder):
 def get_subprocess_env(server_dir):
     # Isolation: bots get a minimal env, NOT the host's (which contains secrets
     # like ADMIN_PASS / PANEL_SECRET_KEY). Only pass platform-agnostic vars plus
-    # anything the owner defines in their own .env file.
+    # anything the owner defines in their own .env file. Dangerous/interpreter-
+    # altering keys are always stripped so a bot can't smuggle e.g. LD_PRELOAD
+    # through a .env upload.
     env = {}
     for k in ("PATH", "HOME", "TZ", "LANG", "LC_ALL", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"):
         if k in os.environ:
             env[k] = os.environ[k]
     env['PYTHONUNBUFFERED'] = '1'
     env['PYTHONDONTWRITEBYTECODE'] = '1'
+    # Point the bot's user environment into its own dir so pip/git/scripts never
+    # touch host paths like $HOME or system site-packages.
+    env['HOME'] = server_dir
+    env['PYTHONUSERBASE'] = os.path.join(server_dir, ".pyuser")
 
     env_path = os.path.join(server_dir, ".env")
     if os.path.isfile(env_path):
@@ -509,7 +759,10 @@ def get_subprocess_env(server_dir):
                 if not line or line.startswith("#") or "=" not in line:
                     continue
                 key, _, val = line.partition("=")
-                env[key.strip()] = val.strip()
+                key = key.strip()
+                if key in _ISOLATION_ENV_DENY:
+                    continue
+                env[key] = val.strip()
     return env
 
 
@@ -576,7 +829,7 @@ def resolve_pkg(mod_name):
     return IMPORT_TO_PKG.get(top, IMPORT_TO_PKG.get(mod_name, mod_name))
 
 try:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "pip"], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "--user", "--upgrade", "pip"], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
 except:
     pass
 
@@ -595,7 +848,7 @@ while True:
             top_mod = pkg.split('.')[0]
             if top_mod != install_name:
                 subprocess.check_call([sys.executable, "-m", "pip", "uninstall", "-y", top_mod], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-            subprocess.check_call([sys.executable, "-m", "pip", "install", install_name])
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "--user", install_name])
             append_installed(install_name)
             print(f"[AUTO] Installed: {{install_name}} -> restarting...")
             continue
@@ -613,9 +866,9 @@ while True:
                 try:
                     top_mod = pkg.split('.')[0]
                     subprocess.check_call([sys.executable, "-m", "pip", "uninstall", "-y", top_mod], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-                    subprocess.check_call([sys.executable, "-m", "pip", "install", install_name])
-                    append_installed(install_name)
-                    print(f"[AUTO] Installed: {{install_name}} -> restarting...")
+                subprocess.check_call([sys.executable, "-m", "pip", "install", "--user", install_name])
+                append_installed(install_name)
+                print(f"[AUTO] Installed: {{install_name}} -> restarting...")
                     continue
                 except:
                     pass
@@ -630,7 +883,18 @@ while True:
 def start_with_autoinstall(owner, folder, startup_file):
     server_dir = get_server_dir(owner, folder)
     log_path = os.path.join(server_dir, "server.log")
-    log_file = open(log_path, "a", encoding="utf-8", errors="ignore")
+
+    # Zero-trust: hand the server dir to the bot's dedicated OS user and run the
+    # process demoted into its own session (own process group -> can't signal the
+    # panel, and psutil kill can reap the whole tree). Popen user=/group= performs
+    # setuid via _posixsubprocess in the child after fork — thread-safe.
+    uid, gid = _bot_user_info(owner, folder)
+    iso_kwargs = {}
+    if uid is not None:
+        _harden_zone(owner, folder)
+        iso_kwargs = {"user": uid, "group": gid, "extra_groups": [], "start_new_session": True}
+
+    log_file = safe_open_write(log_path, "a")
 
     if startup_file.lower().endswith(".php"):
         proc = subprocess.Popen(
@@ -639,6 +903,7 @@ def start_with_autoinstall(owner, folder, startup_file):
             stdout=log_file,
             stderr=log_file,
             env=get_subprocess_env(server_dir),
+            **iso_kwargs,
         )
     else:
         wrapper_code = WRAPPER_TEMPLATE.format(base_dir=BASE_DIR)
@@ -648,7 +913,9 @@ def start_with_autoinstall(owner, folder, startup_file):
             stdout=log_file,
             stderr=log_file,
             env=get_subprocess_env(server_dir),
+            **iso_kwargs,
         )
+    _apply_rlimits(proc.pid, get_user_mem_limit(owner))
     return proc, log_file
 
 
@@ -992,7 +1259,8 @@ def add_server():
         return jsonify({"success": False, "message": "Server already exists"}), 409
 
     os.makedirs(target, exist_ok=True)
-    open(os.path.join(target, "server.log"), "w", encoding="utf-8").close()
+    with safe_open_write(os.path.join(target, "server.log"), "w"):
+        pass
 
     meta = {
         "display_name": name or folder,
@@ -1110,7 +1378,8 @@ def server_action(key, act):
     if not startup:
         return jsonify({"success": False, "message": "No main file set"}), 400
 
-    open(os.path.join(server_dir, "server.log"), "w", encoding="utf-8").close()
+    with safe_open_write(os.path.join(server_dir, "server.log"), "w"):
+        pass
 
     t = threading.Thread(target=background_start, args=(key, owner, folder, startup), daemon=True)
     t.start()
@@ -1193,8 +1462,11 @@ def file_content(key):
         return jsonify({"content": ""}), 400
     if os.path.isdir(full):
         return jsonify({"content": ""}), 400
+    f = safe_open_read(full)
+    if f is None:
+        return jsonify({"content": ""})
     try:
-        with open(full, "r", encoding="utf-8", errors="ignore") as f:
+        with f:
             return jsonify({"content": f.read()})
     except Exception:
         return jsonify({"content": ""})
@@ -1227,8 +1499,9 @@ def file_save(key):
 
     os.makedirs(os.path.dirname(full), exist_ok=True)
     try:
-        with open(full, "w", encoding="utf-8") as f:
+        with safe_open_write(full, "w") as f:
             f.write(content)
+        _bot_chown(owner, folder, full)
         return jsonify({"success": True})
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
@@ -1353,7 +1626,11 @@ def file_upload(key):
         current_size_mb += file_length / 1024 / 1024
 
         os.makedirs(target_dir, exist_ok=True)
-        f.save(os.path.join(target_dir, filename))
+        f.seek(0)
+        dst = os.path.join(target_dir, filename)
+        with safe_open_write(dst, "wb") as out:
+            shutil.copyfileobj(f, out)
+        _bot_chown(owner, folder, dst)
         saved += 1
 
     return jsonify({"success": True, "saved": saved})
@@ -1583,10 +1860,10 @@ def truncate_large_logs():
             log_path = os.path.join(get_server_dir(owner, folder), "server.log")
             try:
                 if os.path.exists(log_path) and os.path.getsize(log_path) > MAX_LOG_SIZE:
-                    with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    with safe_open_read(log_path) as f:
                         f.seek(os.path.getsize(log_path) - MAX_LOG_SIZE // 2)
                         content = f.read()
-                    with open(log_path, 'w', encoding='utf-8') as f:
+                    with safe_open_write(log_path, "w") as f:
                         f.write("[SYSTEM] Log truncated\n" + content)
             except Exception:
                 pass
@@ -1641,6 +1918,18 @@ signal.signal(signal.SIGINT, graceful_shutdown)
 if __name__ == "__main__":
     port = int(os.environ.get("SERVER_PORT", 7860))
     logger.info(f"--- SYSTEM INITIALIZATION: Port {port} ---")
+
+    # Zero-trust boot: lock panel data away from any bot user before serving.
+    if _is_posix_root():
+        for d in (DATA_DIR,):
+            try:
+                os.chmod(d, 0o700)
+            except OSError:
+                pass
+        if ISOLATION_ENABLED:
+            logger.info("OS user isolation enabled (each bot runs as its own Unix user)")
+        else:
+            logger.warning("BOT_ISOLATION disabled: bots share the panel's user. Not zero-trust!")
 
     threading.Thread(target=run_keep_alive, daemon=True).start()
     threading.Thread(target=run_log_cleaner, daemon=True).start()
