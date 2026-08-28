@@ -141,6 +141,47 @@ def _bot_user_name(owner, folder):
     return f"bot_{digest}"
 
 
+# Bots are allocated UIDs from a DEDICATED range (not the sequential system
+# range) so iptables can match every bot in one rule: `--uid-owner MIN-MAX`.
+# Deployments may override via env, but the same value must be used everywhere.
+BOT_UID_MIN = int(os.environ.get("BOT_UID_MIN", 30000))
+BOT_UID_MAX = int(os.environ.get("BOT_UID_MAX", 59999))
+_BOT_UID_FILE = os.path.join(DATA_DIR, "bot_uids.json")
+
+
+def _alloc_bot_uid(name):
+    """Reserve the bot's UID from BOT_UID_MIN..BOT_UID_MAX and persist it in
+    DATA/. /etc/passwd is ephemeral in a container (gone on restart) while DATA/
+    survives, so the allocation map is the durable source of truth and must also
+    serve as the descriptor used by iptables. Runs under the global lock."""
+    with lock:
+        alloc = {}
+        if os.path.isfile(_BOT_UID_FILE):
+            try:
+                with open(_BOT_UID_FILE, "r", encoding="utf-8") as f:
+                    alloc = json.load(f) or {}
+            except Exception:
+                alloc = {}
+        if name in alloc:
+            return int(alloc[name])
+        used = set(int(v) for v in alloc.values())
+        uid = BOT_UID_MIN
+        while uid in used and uid <= BOT_UID_MAX:
+            uid += 1
+        if uid > BOT_UID_MAX:
+            logger.warning(f"Isolation: bot UID range exhausted ({BOT_UID_MIN}-{BOT_UID_MAX})")
+            return None
+        alloc[name] = uid
+        with safe_open_write(_BOT_UID_FILE, "w") as f:
+            json.dump(alloc, f, indent=2)
+        if _is_posix_root():
+            try:
+                os.chmod(_BOT_UID_FILE, 0o600)
+            except OSError:
+                pass
+        return uid
+
+
 def _bot_user_info(owner, folder):
     """Return (uid, gid) for the bot's dedicated OS user, creating it if needed.
     Returns (None, None) when OS isolation is unavailable (non-root / non-POSIX)."""
@@ -152,9 +193,12 @@ def _bot_user_info(owner, folder):
         return entry.pw_uid, entry.pw_gid
     except KeyError:
         pass
+    uid = _alloc_bot_uid(name)
+    if uid is None:
+        return None, None
     try:
         subprocess.run(
-            ["useradd", "-M", "-s", "/usr/sbin/nologin", "-N", name],
+            ["useradd", "-M", "-s", "/usr/sbin/nologin", "-N", "-u", str(uid), name],
             check=True, capture_output=True, timeout=30,
         )
         entry = _pwd.getpwnam(name)
@@ -207,6 +251,16 @@ def _harden_zone(owner, folder):
         return
     server_dir = get_server_dir(owner, folder)
     if os.path.isdir(server_dir):
+        # Per-bot scratch space (see get_subprocess_env TMPDIR/TEMP/TMP): create
+        # it BEFORE the recursive chown so it is born root-owned 0700, then
+        # handed to the bot. Keeps all volatile files inside the sandbox instead
+        # of the shared system /tmp where other users can predict names.
+        tmp_dir = os.path.join(server_dir, ".tmp")
+        try:
+            os.makedirs(tmp_dir, exist_ok=True)
+            os.chmod(tmp_dir, 0o700)
+        except OSError:
+            pass
         _chown_recursive(server_dir, uid, gid)
         try:
             os.chmod(server_dir, 0o700)
@@ -247,19 +301,141 @@ def _apply_rlimits(pid, mem_mb):
     except Exception:
         pass
 
+
+# ===== Boot hardening: network + process visibility (run ONCE, cheap) =====
+
+def _ipt(args, timeout=20):
+    """Run an iptables command under the xtables lock. Returns the CompletedProcess
+    or None (tool missing / crash). A failed rule must never crash the panel."""
+    try:
+        return subprocess.run(
+            ["iptables", "-w"] + args,
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except Exception:
+        return None
+
+
+def _proc_hidepid_active():
+    try:
+        with open("/proc/self/mountinfo", "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if " /proc " in line and "hidepid=" in line:
+                    return "hidepid=2" in line
+    except Exception:
+        pass
+    return False
+
+
+def mount_hidepid():
+    """Best-effort /proc masking: remount procfs with hidepid=2 so bots (any
+    non-root UID) cannot enumerate /proc/<pid> or read the panel's and other
+    bots' process entries (PID lists, cmdlines, ...). Requires CAP_SYS_ADMIN at
+    the container level (`docker run --cap-add=SYS_ADMIN`, see README). If the
+    runtime did not grant it, the remount is skipped with a warning and the
+    per-UID ptrace checks (kernel) still keep /proc/<pid>/environ|cmdline|mem of
+    the panel unreadable to a different-UID bot."""
+    if not _is_posix_root() or not os.path.isdir("/proc"):
+        return False
+    if _proc_hidepid_active():
+        return True
+    try:
+        subprocess.run(
+            ["mount", "-o", "remount,rw,nosuid,nodev,noexec,relatime,hidepid=2", "/proc"],
+            check=True, capture_output=True, timeout=30,
+        )
+    except Exception as e:
+        stderr = getattr(e, "stderr", None)
+        msg = stderr.decode("utf-8", "ignore").strip() if stderr else str(e)
+        logger.warning(
+            f"Process masking unavailable (hidepid=2 on /proc): {msg}. "
+            "Run the container with CAP_SYS_ADMIN to hide panel PIDs from bots."
+        )
+        return False
+    if _proc_hidepid_active():
+        logger.info("Process masking active: /proc mounted with hidepid=2")
+        return True
+    logger.warning("mount hidepid=2 reported success but /proc is not masked")
+    return False
+
+
+def setup_network_isolation():
+    """Run ONCE at boot (root + CAP_NET_ADMIN + iptables installed): zero-trust
+    network rules for the bot UID range. Bots keep full internet egress (they
+    must talk to Telegram/webhooks) but can NEVER reach the loopback net: the
+    panel binds 0.0.0.0, so both 127.0.0.1 and the container's own IP resolve
+    onto it. Carve-outs:
+      1. Docker embedded DNS 127.0.0.11:53 (name resolution keeps working),
+      2. extra loopback targets in LOOPBACK_ALLOW="ip:port/tcp,ip:port/udp".
+    Everything else from a bot UID towards lo / the panel port / the container's
+    own IP is REJECTed. Idempotent: a dedicated BOTISOL chain is flushed and
+    rebuilt each boot (single-shot, no per-request cost)."""
+    if not _is_posix_root() or shutil.which("iptables") is None:
+        logger.warning(
+            "Network isolation skipped: needs iptables + root + CAP_NET_ADMIN "
+            "(see README). Without it a bot could reach panel ports on localhost."
+        )
+        return False
+    uid_range = f"{BOT_UID_MIN}-{BOT_UID_MAX}"
+    ok = True
+
+    # (Re)build the dedicated chain so repeated boots never stack duplicate rules.
+    for args in (["-F", "BOTISOL"], ["-X", "BOTISOL"], ["-N", "BOTISOL"]):
+        _ipt(args)
+    _ipt(["-D", "OUTPUT", "-j", "BOTISOL"])
+    _ipt(["-A", "OUTPUT", "-j", "BOTISOL"])
+
+    def add(args):
+        nonlocal ok
+        r = _ipt(args)
+        if r is not None and r.returncode != 0:
+            ok = False
+            logger.warning(f"iptables rule failed ({r.stderr.strip()}): {' '.join(args)}")
+
+    # 1) DNS carve-out: Docker's embedded resolver (cluster DNS uses 127.0.0.11).
+    for proto in ("udp", "tcp"):
+        add(["-A", "BOTISOL", "-o", "lo", "-d", "127.0.0.11", "-p", proto,
+             "--dport", "53", "-m", "owner", "--uid-owner", uid_range,
+             "-j", "ACCEPT"])
+    # 2) Admin-approved loopback targets (e.g. a local cache sidecar the bots may use).
+    for ent in os.environ.get("LOOPBACK_ALLOW", "").replace(" ", "").split(","):
+        if not ent:
+            continue
+        host, _, rest = ent.partition(":")
+        port, _, proto = rest.partition("/")
+        if host and port.isdigit() and proto in ("tcp", "udp"):
+            add(["-A", "BOTISOL", "-o", "lo", "-d", host, "-p", proto,
+                 "--dport", port, "-m", "owner", "--uid-owner", uid_range,
+                 "-j", "ACCEPT"])
+    # 3) The choke point: no other loopback left for any bot UID.
+    add(["-A", "BOTISOL", "-o", "lo", "-m", "owner",
+         "--uid-owner", uid_range, "-j", "REJECT"])
+    # 4) Panel port explicitly denied on lo too (redundant, self-documenting).
+    port = str(int(os.environ.get("SERVER_PORT", 7860)))
+    for proto in ("tcp", "udp"):
+        add(["-A", "BOTISOL", "-o", "lo", "-p", proto, "--dport", port,
+             "-m", "owner", "--uid-owner", uid_range, "-j", "REJECT"])
+    # 5) The container's own address: dialing it routes via lo (covered above)
+    #    but also reject it explicitly so a service-IP scan comes back empty.
+    try:
+        out = subprocess.run(["hostname", "-I"], capture_output=True, text=True, timeout=10).stdout
+        for ip in out.split():
+            if ip and not ip.startswith("127."):
+                add(["-A", "BOTISOL", "-d", ip, "-m", "owner",
+                     "--uid-owner", uid_range, "-j", "REJECT"])
+    except Exception:
+        pass
+
+    if ok:
+        logger.info(f"Network isolation active: bots (uid {uid_range}) blocked from loopback/panel, internet egress open")
+    else:
+        logger.warning("Network isolation partially applied; review the iptables errors logged above.")
+    return ok
+
 # Bolt: per-path cache of server.log contents, keyed on mtime+size so reads are
 # skipped when the file is unchanged (append-only logs). Bounded by the number of
 # servers and by MAX_LOG_SIZE (logs are truncated to ~1MB by truncate_large_logs).
 _log_cache = {}
-
-
-def safe_open_read(path):
-    """Open for reading with O_NOFOLLOW (ELOOP => return None)."""
-    try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-        return os.fdopen(fd, "r", encoding="utf-8", errors="ignore")
-    except OSError:
-        return None
 
 
 def read_server_log(path):
@@ -723,7 +899,7 @@ def ensure_requirements_installed(owner, folder):
         subprocess.check_call(
             [sys.executable, "-m", "pip", "install", "--user", "-r", "requirements.txt"],
             cwd=server_dir,
-            env=get_subprocess_env(server_dir),
+            env=get_subprocess_env(server_dir, owner, folder),
             **iso_kwargs,
         )
         write_installed(owner, folder, req_sha=req_sha)
@@ -734,7 +910,7 @@ def ensure_requirements_installed(owner, folder):
         return False
 
 
-def get_subprocess_env(server_dir):
+def get_subprocess_env(server_dir, owner=None, folder=None):
     # Isolation: bots get a minimal env, NOT the host's (which contains secrets
     # like ADMIN_PASS / PANEL_SECRET_KEY). Only pass platform-agnostic vars plus
     # anything the owner defines in their own .env file. Dangerous/interpreter-
@@ -750,6 +926,28 @@ def get_subprocess_env(server_dir):
     # touch host paths like $HOME or system site-packages.
     env['HOME'] = server_dir
     env['PYTHONUSERBASE'] = os.path.join(server_dir, ".pyuser")
+
+    # TMP isolation: redirect ALL scratch space into the bot's own sandbox. Bots
+    # run as their own UID but share the world-writable system /tmp, which lets
+    # any other local user predict file names and plant symlinks. Point TMPDIR /
+    # TEMP / TMP at server_dir/.tmp, owned by the bot, mode 0700.
+    tmp_dir = os.path.join(server_dir, ".tmp")
+    try:
+        os.makedirs(tmp_dir, exist_ok=True)
+        if os.name == "posix":
+            os.chmod(tmp_dir, 0o700)
+    except OSError:
+        pass
+    if owner and folder and ISOLATION_ENABLED and _is_posix_root():
+        uid, gid = _bot_user_info(owner, folder)
+        if uid is not None:
+            try:
+                os.chown(tmp_dir, uid, gid)
+            except OSError:
+                pass
+    env['TMPDIR'] = tmp_dir
+    env['TEMP'] = tmp_dir
+    env['TMP'] = tmp_dir
 
     env_path = os.path.join(server_dir, ".env")
     if os.path.isfile(env_path):
@@ -902,7 +1100,7 @@ def start_with_autoinstall(owner, folder, startup_file):
             cwd=server_dir,
             stdout=log_file,
             stderr=log_file,
-            env=get_subprocess_env(server_dir),
+            env=get_subprocess_env(server_dir, owner, folder),
             **iso_kwargs,
         )
     else:
@@ -912,7 +1110,7 @@ def start_with_autoinstall(owner, folder, startup_file):
             cwd=server_dir,
             stdout=log_file,
             stderr=log_file,
-            env=get_subprocess_env(server_dir),
+            env=get_subprocess_env(server_dir, owner, folder),
             **iso_kwargs,
         )
     _apply_rlimits(proc.pid, get_user_mem_limit(owner))
@@ -1930,6 +2128,9 @@ if __name__ == "__main__":
             logger.info("OS user isolation enabled (each bot runs as its own Unix user)")
         else:
             logger.warning("BOT_ISOLATION disabled: bots share the panel's user. Not zero-trust!")
+        # One-shot boot hardening: /proc masking + loopback network isolation.
+        mount_hidepid()
+        setup_network_isolation()
 
     threading.Thread(target=run_keep_alive, daemon=True).start()
     threading.Thread(target=run_log_cleaner, daemon=True).start()

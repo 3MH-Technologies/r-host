@@ -8,6 +8,7 @@ RUN apt-get update && apt-get install -y \
     curl \
     git \
     util-linux \
+    iptables \
     && rm -rf /var/lib/apt/lists/*
 
 # Zero-trust: the panel runs as root so it can create a dedicated OS user per

@@ -12,7 +12,10 @@
 - **Auto-install** — تثبيت تلقائي لـ `requirements.txt` ولأي مكتبة استيراد ناقصة عند التشغيل
 - **Starter system** — تشغيل أي ملف بداية تحدده (افتراضياً `main.py`)
 - **Per-bot secrets** — ضع أسرار البوت في ملف `.env` داخل مجلده، تُحمَّل تلقائياً بمعزل تام عن بيئة الهوست
-- **Zero-Trust OS isolation** — كل بوت يشتغل كمستخدم Unix مستقل خاص فيه (`bot_<hash>`): بلا صلاحية لأي ملف منصة (`DATA/` 0700، ملفات 0600)، كوبيات للبوت فقط (`server.log`/`meta.json`/upload تُكتب بـ O_NOFOLLOW ضد الروابط الخداعية)، حد ذاكرة/عمليات/ملفات عبر `prlimit`، بيئة معقّمة بلا مفاتيح هوست ولا متغيرات خطيرة (`LD_PRELOAD`/`PYTHONPATH`...)، و`pip` يثبّت داخل مجلد البوت فقط (`--user`)
+- **Zero-Trust OS isolation** — كل بوت يشتغل كمستخدم Unix مستقل خاص فيه (`bot_<hash>`) من نطاق UID خاص (30000–59999): بلا صلاحية لأي ملف منصة (`DATA/` 0700، ملفات 0600)، كوبيات للبوت فقط (`server.log`/`meta.json`/upload تُكتب بـ O_NOFOLLOW ضد الروابط الخداعية)، حد ذاكرة/عمليات/ملفات عبر `prlimit`، بيئة معقّمة بلا مفاتيح هوست ولا متغيرات خطيرة (`LD_PRELOAD`/`PYTHONPATH`...)، و`pip` يثبّت داخل مجلد البوت فقط (`--user`)
+- **Network isolation (iptables)** — عند الإقلاع تُبنى سلسلة `BOTISOL`: البوتات **ممنوعة من loopback كلياً** (لا يستطيعون الوصول لمنافذ الـ Panel عبر `127.0.0.1` أو IP الحاوية أو المسح المحلي)، إلا DNS الـ container (`127.0.0.11:53`) وما يسمح به `LOOPBACK_ALLOW`، مع بقاء الإنترنت الخارجي مفتوحاً
+- **TMP isolation** — `TMPDIR`/`TEMP`/`TMP` تُوجَّه لمجلد `.tmp` خاص داخل مجلد البوت (0700 مملوك له) بدل `/tmp` العام
+- **Process masking** — remount لـ `/proc` بـ `hidepid=2` لمنع البوتات من رؤية PIDs/عمليات الـ Panel والبوتات الأخرى (يتطلب `CAP_SYS_ADMIN`)
 - **File manager** — مدير ملفات (رفع، تعديل، إنشاء، حذف، إعادة تسمية) مع محرر أكواد مدمج (Ctrl+S للحفظ، TAB للإزاحة)
 - **Live console** — لوحة تحكم مباشرة تعرض الـ logs كل ثانيتين
 - **AI assistant** — مساعد ذكي مدمج لمساعدة المستخدمين في الأكواد (حد يومي)
@@ -50,8 +53,11 @@ docker build -t whitewolf .
 docker run -p 7860:7860 \
   -e ADMIN_USER=admin \
   -e ADMIN_PASS="ضع-كلمة-مرور-قوية" \
+  --cap-add=NET_ADMIN --cap-add=SYS_ADMIN \
   whitewolf
 ```
+
+> ⚠️ **صلاحيات التشغيل (crucial):** عزل الشبكة (`iptables`) يحتاج `NET_ADMIN`، وإخفاء العمليات (`hidepid=2` على `/proc`) يحتاج `SYS_ADMIN`. بدونها لا يتعطل النظام — بل **يحذّر في اللوق ويستمر** (تبقى الحماية بطبقة UID، لكن loopback من البوتات والـ /proc غير مُقيَّدَين). أضف الحرفين أعلاه لتفعيل الطبقتين. (مع `docker-compose` استخدم `cap_add: [NET_ADMIN, SYS_ADMIN]`.)
 
 ### Hugging Face Space
 ضبط **Variables and secrets** في إعدادات الـ Space:
@@ -71,6 +77,9 @@ docker run -p 7860:7860 \
 | `PANEL_SECRET_KEY` | ❌ | عشوائي | مفتاح توقيع الجلسات (يفضل ضبطه) |
 | `SESSION_COOKIE_SECURE` | ❌ | `true` | Secure cookie للجلسات |
 | `MAX_PROC_MEM_MB` | ❌ | `512` | الحد الأقصى لذاكرة البوت الواحد |
+| `BOT_UID_MIN` / `BOT_UID_MAX` | ❌ | `30000` / `59999` | نطاق UIDs المخصص للبوتات (يُطابَق بقاعدة iptables) |
+| `LOOPBACK_ALLOW` | ❌ | — | استثناءات loopback مسموحة للبوتات، مثال: `127.0.0.2:8080/tcp,127.0.0.1:53/udp` |
+| `BOT_ISOLATION` | ❌ | `1` | تعطيل عزل المستخدمين (`0`) — غير موصى به نهائياً |
 | `DEVELOPER_URL` | ❌ | — | توجيه صفحة المطور لرابط خارجي |
 | `SPACE_ID` | ❌ | — | تعطيل Git auto-sync تلقائياً في Space |
 
