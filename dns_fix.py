@@ -1,3 +1,16 @@
+# ============================================================
+#  White Wolf  |  Telegram Bot Hosting Platform
+#
+#  (c) 3MH TECHNOLOGIES : https://3mh.pages.dev/
+#  Developed by White Wolf : https://t.me/j49_c
+#
+#  All rights reserved.
+# ============================================================
+#
+# Patches socket.getaddrinfo to always resolve IPv4 first. Some bot libraries
+# stumble on IPv6 answers (timeouts / "unreachable"), so we force AF_INET while
+# leaving every other resolution resource untouched.
+
 import socket
 
 

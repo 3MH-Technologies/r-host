@@ -1,4 +1,13 @@
 # -*- coding: utf-8 -*-
+# ============================================================
+#  White Wolf  |  Telegram Bot Hosting Platform
+#
+#  (c) 3MH TECHNOLOGIES : https://3mh.pages.dev/
+#  Developed by White Wolf : https://t.me/j49_c
+#
+#  All rights reserved.
+# ============================================================
+#
 # Telegram Reverse Proxy relay (zero-trust default egress for bots).
 #
 # Routes every bot's api.telegram.org traffic AUTOMATICALLY through the
@@ -6,18 +15,18 @@
 #
 #   bot -> [our local proxy] --TLS--> 3MH worker --TLS--> api.telegram.org
 #
-# The Worker is a REVERSE proxy (not a forward/CONNECT proxy), so a naive
-# HTTPS_PROXY won't work: a CONNECT tunnel carries the client's TLS ClientHello
-# verbatim, whose SNI is `api.telegram.org` (from the bot's URL). Cloudflare's
-# edge would then route to Telegram's own zone, never to our Worker.
+# Why this exists: the Worker is a REVERSE proxy, not a forward/CONNECT proxy.
+# A plain HTTPS_PROXY would not work, because a CONNECT tunnel carries the
+# client's TLS ClientHello verbatim and its SNI is `api.telegram.org` (taken from
+# the bot's URL) - so Cloudflare would route the handshake to Telegram's own
+# zone, never to our Worker.
 #
-# The only way to force routing while keeping TLS validation intact is to act as
-# a tiny TLS-terminating relay for the api.telegram.org hosts (our own CA, which
-# every bot trusts via REQUESTS_CA_BUNDLE / SSL_CERT_FILE / a certifi shim) and
-# re-issue a TLS connection to the Worker with SNI = worker hostname. The bot's
-# HTTP bytes are then relayed verbatim (path + params unchanged; the Worker
-# rewrites Host itself). Everything else is PURE TCP passthrough: no MITM, no
-# overhead for non-Telegram traffic.
+# The solution is to act as a tiny TLS-terminating relay for the api.telegram.org
+# hosts (using a dedicated CA that every bot trusts via REQUESTS_CA_BUNDLE /
+# SSL_CERT_FILE and a certifi shim), then re-issue a fresh TLS connection to the
+# Worker with the correct SNI. The bot's HTTP bytes are relayed verbatim (path +
+# params unchanged; the Worker rewrites Host itself). Everything else is PURE TCP
+# passthrough: no MITM, no overhead for non-Telegram traffic.
 #
 # Two ingress modes:
 #   * CONNECT proxy  (port TG_LOCAL_PROXY_PORT, bots pointed at it via env vars)
@@ -25,9 +34,9 @@
 #                     bot flows destined to Telegram's CIDRs -> covers any client,
 #                     e.g. PHP/aiogram which ignore environment proxies)
 #
-# Efficiency: single-shot CA/cert generation at boot, cached contexts, and a byte
-# pipe (threaded recv/send) per connection. Bots are capped at 256 procs by
-# prlimit anyway.
+# Cost is trivial: the CA and certs are generated once at boot and cached, and
+# each connection is just a byte pipe (two threaded sockets). Bots are already
+# capped at 256 processes by prlimit, so this can't be abused into a fork bomb.
 
 import json
 import os

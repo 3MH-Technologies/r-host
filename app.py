@@ -1,3 +1,12 @@
+# ============================================================
+#  White Wolf  |  Telegram Bot Hosting Platform
+#
+#  (c) 3MH TECHNOLOGIES : https://3mh.pages.dev/
+#  Developed by White Wolf : https://t.me/j49_c
+#
+#  All rights reserved.
+# ============================================================
+
 import os
 import json
 import re
@@ -427,7 +436,8 @@ def setup_network_isolation():
     # 4) The choke point: no other loopback left for any bot UID.
     add(["-A", "BOTISOL", "-o", "lo", "-m", "owner",
          "--uid-owner", uid_range, "-j", "REJECT"])
-    # 5) Panel port explicitly denied on lo too (redundant, self-documenting).
+    # 5) The panel's own port on loopback too — the blanket rule above already
+    #    kills it, but keeping it explicit documents the intent.
     port = str(int(os.environ.get("SERVER_PORT", 7860)))
     for proto in ("tcp", "udp"):
         add(["-A", "BOTISOL", "-o", "lo", "-p", proto, "--dport", port,
@@ -458,9 +468,10 @@ def setup_network_isolation():
         logger.warning("Network isolation partially applied; review the iptables errors logged above.")
     return ok
 
-# Bolt: per-path cache of server.log contents, keyed on mtime+size so reads are
-# skipped when the file is unchanged (append-only logs). Bounded by the number of
-# servers and by MAX_LOG_SIZE (logs are truncated to ~1MB by truncate_large_logs).
+# Per-path cache of server.log contents, keyed on mtime+size so unchanged
+# (append-only) logs skip the disk read on the dashboard's 2s polls. It's
+# bounded by the number of running servers and MAX_LOG_SIZE (logs are truncated
+# to ~1MB by truncate_large_logs), so it can't grow without limit.
 _log_cache = {}
 
 
@@ -546,12 +557,12 @@ def load_users():
     try:
         st = os.stat(USERS_DB)
         cache = _users_cache
-        # Bolt: cache the parsed users DB keyed on file mtime+size. users.json is
-        # read on nearly every authenticated request (sometimes 2-3x per request,
-        # e.g. api_user_profile via get_user_limit + get_user_mem_limit), and a
-        # cold parse of a large DB costs ~25ms. save_users() writes atomically via
-        # os.replace, so mtime/size change on every save and the cache self-invalidates;
-        # manual/hand edits to the file are also picked up on the next read.
+        # users.json is read on nearly every authenticated request (sometimes
+        # 2-3x per request, e.g. api_user_profile via get_user_limit + get_user_mem_limit),
+        # and a cold parse of a large DB costs ~25ms. save_users() writes atomically
+        # via os.replace, so mtime/size change on every save and the cache
+        # self-invalidates; manual/hand edits to the file are also picked up on
+        # the next read.
         if cache["data"] is not None and cache["mtime"] == st.st_mtime and cache["size"] == st.st_size:
             return cache["data"]
         with open(USERS_DB, "r", encoding="utf-8") as f:
@@ -604,16 +615,15 @@ PLANS = {
 ADS_FILE = os.path.join(DATA_DIR, "ads.json")
 
 WT_CONTACT = "https://t.me/j49_c"
-WT_CHANNEL = "https://t.me/bshshshkk"
 
 def load_ads():
     if not os.path.exists(ADS_FILE):
-        return {"current_ad": "", "contact_link": WT_CONTACT, "channel_link": WT_CHANNEL}
+        return {"current_ad": "", "contact_link": WT_CONTACT}
     try:
         with open(ADS_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except:
-        return {"current_ad": "", "contact_link": WT_CONTACT, "channel_link": WT_CHANNEL}
+        return {"current_ad": "", "contact_link": WT_CONTACT}
 
 
 def save_ads(data):
@@ -1540,7 +1550,7 @@ def server_stats(key):
                 pass
 
     log_path = os.path.join(server_dir, "server.log")
-    # Bolt: cached read - unchanged logs skip re-reading on every 2s poll.
+    # Cached read (see _log_cache): unchanged logs skip the disk on the 2s poll.
     logs = read_server_log(log_path)
 
     state = get_state(key)

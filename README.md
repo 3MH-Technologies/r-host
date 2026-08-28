@@ -2,7 +2,15 @@
 
 منصة استضافة بوتات التلجرام | Telegram bot hosting platform with a web panel, file manager, console, and AI assistant.
 
-**القناة/Channel:** [t.me/bshshshkk](https://t.me/bshshshkk) · **التواصل/Contact:** [t.me/j49_c](https://t.me/j49_c)
+**التواصل/Contact:** [t.me/j49_c](https://t.me/j49_c)
+
+---
+
+## ⚖️ Copyright
+
+> (c) **3MH TECHNOLOGIES** — [3mh.pages.dev](https://3mh.pages.dev/) · Developed by **White Wolf** — [t.me/j49_c](https://t.me/j49_c)
+>
+> جميع الحقوق محفوظة | All rights reserved
 
 ---
 

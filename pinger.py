@@ -1,3 +1,15 @@
+# ============================================================
+#  White Wolf  |  Telegram Bot Hosting Platform
+#
+#  (c) 3MH TECHNOLOGIES : https://3mh.pages.dev/
+#  Developed by White Wolf : https://t.me/j49_c
+#
+#  All rights reserved.
+# ============================================================
+#
+# Standalone keep-alive: hits the panel's /health endpoint on a timer so the
+# service stays warm (useful on sandboxed hosts that idle out).
+
 import requests
 import time
 import datetime
