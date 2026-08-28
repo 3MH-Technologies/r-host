@@ -148,10 +148,10 @@
 
       <div class="form-section active" id="loginForm">
         <div class="input-group">
-          <input id="lu" placeholder="Username / اسم المستخدم" autocomplete="username">
+          <input id="lu" placeholder="Username / اسم المستخدم" aria-label="Username / اسم المستخدم" autocomplete="username">
         </div>
         <div class="input-group">
-          <input id="lp" placeholder="Password / كلمة المرور" type="password" autocomplete="current-password">
+          <input id="lp" placeholder="Password / كلمة المرور" aria-label="Password / كلمة المرور" type="password" autocomplete="current-password">
         </div>
         <button class="btn" onclick="doLogin()">
           <span id="loginBtnText">AUTHENTICATE / تسجيل الدخول</span>
@@ -162,16 +162,16 @@
       <div class="form-section" id="registerForm">
         <div id="regStep1">
           <div class="input-group">
-            <input id="re" placeholder="Email Address / البريد الإلكتروني" type="email" autocomplete="email">
+            <input id="re" placeholder="Email Address / البريد الإلكتروني" aria-label="Email Address / البريد الإلكتروني" type="email" autocomplete="email">
           </div>
           <div class="input-group">
-            <input id="ru" placeholder="Choose a username / اختر اسم مستخدم" autocomplete="off" minlength="3" maxlength="20">
+            <input id="ru" placeholder="Choose a username / اختر اسم مستخدم" aria-label="Choose a username / اختر اسم مستخدم" autocomplete="off" minlength="3" maxlength="20">
           </div>
           <div class="input-group">
-            <input id="rp" placeholder="Create a password / كلمة مرور جديدة" type="password" autocomplete="new-password" minlength="6">
+            <input id="rp" placeholder="Create a password / كلمة مرور جديدة" aria-label="Create a password / كلمة مرور جديدة" type="password" autocomplete="new-password" minlength="6">
           </div>
           <div class="input-group">
-            <input id="rp2" placeholder="Confirm password / تأكيد كلمة المرور" type="password" autocomplete="new-password">
+            <input id="rp2" placeholder="Confirm password / تأكيد كلمة المرور" aria-label="Confirm password / تأكيد كلمة المرور" type="password" autocomplete="new-password">
           </div>
           <button class="btn" onclick="doRegister()">
             <span id="regBtnText">CREATE ACCOUNT / إنشاء حساب</span>
@@ -182,7 +182,7 @@
         <div id="regStep2" style="display:none; text-align:center;">
           <p style="color:var(--text-muted); font-size:14px; margin-bottom: 20px;">Creating your account...<br>جاري إنشاء حسابك...</p>
           <div class="input-group">
-            <input id="rotp" placeholder="Enter 6-digit Code / أدخل الكود" maxlength="6" style="text-align:center; font-size: 24px; letter-spacing: 10px;">
+            <input id="rotp" placeholder="Enter 6-digit Code / أدخل الكود" aria-label="Verification code / كود التحقق" maxlength="6" style="text-align:center; font-size: 24px; letter-spacing: 10px;">
           </div>
           <button class="btn" onclick="doVerify()">
             <span id="verifyBtnText">VERIFY / تأكيد</span>
@@ -197,7 +197,8 @@
         </div>
       </div>
 
-      <div class="msg" id="m"></div>
+      <!-- role="alert" announces login/registration errors to screen readers -->
+      <div class="msg" id="m" role="alert"></div>
 
       <div class="footer">
         © 2026 WHITE WOLF PROTOCOL v0.1<br>
