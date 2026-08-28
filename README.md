@@ -1,8 +1,8 @@
-# 🐺 White Wolf — Bot Hosting Platform
+# 🐺 Wolf Host — Bot Hosting Platform
 
 منصة استضافة بوتات التلجرام | Telegram bot hosting platform with a web panel, file manager, console, and AI assistant.
 
-**التواصل/Contact:** [t.me/j49_c](https://t.me/j49_c)
+**التواصل/Contact:** [t.me/j49_c](https://t.me/j49_c) · **الاسم الداخلي/Internal codename:** `r-host`
 
 ---
 
@@ -58,12 +58,12 @@ python app.py
 ### Docker
 
 ```bash
-docker build -t whitewolf .
+docker build -t wolfhost .
 docker run -p 7860:7860 \
   -e ADMIN_USER=admin \
   -e ADMIN_PASS="ضع-كلمة-مرور-قوية" \
   --cap-add=NET_ADMIN --cap-add=SYS_ADMIN \
-  whitewolf
+  wolfhost
 ```
 
 > ⚠️ **صلاحيات التشغيل (crucial):** عزل الشبكة (`iptables`) يحتاج `NET_ADMIN`، وإخفاء العمليات (`hidepid=2` على `/proc`) يحتاج `SYS_ADMIN`. بدونها لا يتعطل النظام — بل **يحذّر في اللوق ويستمر** (تبقى الحماية بطبقة UID، لكن loopback من البوتات والـ /proc غير مُقيَّدَين). أضف الحرفين أعلاه لتفعيل الطبقتين. (مع `docker-compose` استخدم `cap_add: [NET_ADMIN, SYS_ADMIN]`.)

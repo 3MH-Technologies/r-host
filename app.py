@@ -1,5 +1,6 @@
 # ============================================================
-#  White Wolf  |  Telegram Bot Hosting Platform
+#  Wolf Host  |  Telegram Bot Hosting Platform
+#  Internal codename: r-host
 #
 #  (c) 3MH TECHNOLOGIES : https://3mh.pages.dev/
 #  Developed by White Wolf : https://t.me/j49_c
@@ -1946,7 +1947,7 @@ def api_ai_chat():
     if not message:
         return jsonify({"success": False, "message": "No message provided"}), 400
 
-    SYSTEM_PROMPT = "You are White Wolf AI, a specialized assistant for the White Wolf Bot Hosting platform. Help users with their bots, code, and platform issues. Be helpful and expert."
+    SYSTEM_PROMPT = "You are Wolf Host AI, a specialized assistant for the Wolf Host Bot Hosting platform. Help users with their bots, code, and platform issues. Be helpful and expert."
 
     try:
         full_prompt = f"System: {SYSTEM_PROMPT}\nUser: {message}"

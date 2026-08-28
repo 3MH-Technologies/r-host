@@ -1,5 +1,6 @@
 # ============================================================
-#  White Wolf  |  Telegram Bot Hosting Platform
+#  Wolf Host  |  Telegram Bot Hosting Platform
+#  Internal codename: r-host
 #
 #  (c) 3MH TECHNOLOGIES : https://3mh.pages.dev/
 #  Developed by White Wolf : https://t.me/j49_c
