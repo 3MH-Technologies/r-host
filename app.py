@@ -150,12 +150,29 @@ def log_append(key, text):
         pass
 
 
+_users_cache = {"mtime": None, "size": None, "data": None}
+
+
 def load_users():
     if not os.path.exists(USERS_DB):
         return {"users": []}
     try:
+        st = os.stat(USERS_DB)
+        cache = _users_cache
+        # Bolt: cache the parsed users DB keyed on file mtime+size. users.json is
+        # read on nearly every authenticated request (sometimes 2-3x per request,
+        # e.g. api_user_profile via get_user_limit + get_user_mem_limit), and a
+        # cold parse of a large DB costs ~25ms. save_users() writes atomically via
+        # os.replace, so mtime/size change on every save and the cache self-invalidates;
+        # manual/hand edits to the file are also picked up on the next read.
+        if cache["data"] is not None and cache["mtime"] == st.st_mtime and cache["size"] == st.st_size:
+            return cache["data"]
         with open(USERS_DB, "r", encoding="utf-8") as f:
-            return json.load(f) or {"users": []}
+            data = json.load(f) or {"users": []}
+        cache["mtime"] = st.st_mtime
+        cache["size"] = st.st_size
+        cache["data"] = data
+        return data
     except Exception:
         return {"users": []}
 
