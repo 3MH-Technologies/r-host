@@ -24,6 +24,13 @@ try:
 except ImportError:
     _pwd = None
 
+# Local Telegram reverse-proxy relay (auto-routes bots to the 3MH Worker).
+# Optional: everything degrades gracefully if it is missing/broken.
+try:
+    import tg_proxy
+except Exception:
+    tg_proxy = None
+
 ai_client = None
 
 def get_ai_client():
@@ -397,7 +404,17 @@ def setup_network_isolation():
         add(["-A", "BOTISOL", "-o", "lo", "-d", "127.0.0.11", "-p", proto,
              "--dport", "53", "-m", "owner", "--uid-owner", uid_range,
              "-j", "ACCEPT"])
-    # 2) Admin-approved loopback targets (e.g. a local cache sidecar the bots may use).
+    # 2) Telegram relay ingress: bots must reach the LOCAL relay (CONNECT proxy
+    #    port + the transparent port used by the nat REDIRECT below). These ACCEPTs
+    #    must precede the blanket loopback REJECT or the relay would be unreachable.
+    _proxy_running = tg_proxy is not None and tg_proxy.running()
+    if _proxy_running:
+        p_port, t_port = tg_proxy.safe_rule_target()
+        add(["-A", "BOTISOL", "-o", "lo", "-p", "tcp", "--dport", str(p_port),
+             "-m", "owner", "--uid-owner", uid_range, "-j", "ACCEPT"])
+        add(["-A", "BOTISOL", "-o", "lo", "-p", "tcp", "--dport", str(t_port),
+             "-m", "owner", "--uid-owner", uid_range, "-j", "ACCEPT"])
+    # 3) Admin-approved loopback targets (e.g. a local cache sidecar the bots may use).
     for ent in os.environ.get("LOOPBACK_ALLOW", "").replace(" ", "").split(","):
         if not ent:
             continue
@@ -407,15 +424,15 @@ def setup_network_isolation():
             add(["-A", "BOTISOL", "-o", "lo", "-d", host, "-p", proto,
                  "--dport", port, "-m", "owner", "--uid-owner", uid_range,
                  "-j", "ACCEPT"])
-    # 3) The choke point: no other loopback left for any bot UID.
+    # 4) The choke point: no other loopback left for any bot UID.
     add(["-A", "BOTISOL", "-o", "lo", "-m", "owner",
          "--uid-owner", uid_range, "-j", "REJECT"])
-    # 4) Panel port explicitly denied on lo too (redundant, self-documenting).
+    # 5) Panel port explicitly denied on lo too (redundant, self-documenting).
     port = str(int(os.environ.get("SERVER_PORT", 7860)))
     for proto in ("tcp", "udp"):
         add(["-A", "BOTISOL", "-o", "lo", "-p", proto, "--dport", port,
              "-m", "owner", "--uid-owner", uid_range, "-j", "REJECT"])
-    # 5) The container's own address: dialing it routes via lo (covered above)
+    # 6) The container's own address: dialing it routes via lo (covered above)
     #    but also reject it explicitly so a service-IP scan comes back empty.
     try:
         out = subprocess.run(["hostname", "-I"], capture_output=True, text=True, timeout=10).stdout
@@ -425,6 +442,15 @@ def setup_network_isolation():
                      "--uid-owner", uid_range, "-j", "REJECT"])
     except Exception:
         pass
+
+    # 7) FORCED routing: bot flows to Telegram's CIDRs on :443 are REDIRECTed to
+    #    the transparent relay instead of leaving the container, so even clients
+    #    that ignore proxy env vars (aiogram/PHP) are pulled through the Worker.
+    if _proxy_running:
+        for cidr in tg_proxy.TG_CIDRS:
+            add(["-t", "nat", "-A", "OUTPUT", "-d", cidr, "-p", "tcp",
+                 "--dport", "443", "-m", "owner", "--uid-owner", uid_range,
+                 "-j", "REDIRECT", "--to-ports", str(tg_proxy.TRANS_LISTEN_PORT)])
 
     if ok:
         logger.info(f"Network isolation active: bots (uid {uid_range}) blocked from loopback/panel, internet egress open")
@@ -948,6 +974,13 @@ def get_subprocess_env(server_dir, owner=None, folder=None):
     env['TMPDIR'] = tmp_dir
     env['TEMP'] = tmp_dir
     env['TMP'] = tmp_dir
+
+    # Zero-trust routing: every bot's Telegram API traffic goes through the 3MH
+    # reverse proxy automatically (local relay + iptables enforcement). Bots get
+    # HTTP(S)_PROXY + the relay CA so TLS validation keeps working. No-op if the
+    # relay isn't operational.
+    if tg_proxy is not None and tg_proxy.running():
+        tg_proxy.annotate_bot_env(env, os.path.join(server_dir, ".pyuser"))
 
     env_path = os.path.join(server_dir, ".env")
     if os.path.isfile(env_path):
@@ -2128,6 +2161,13 @@ if __name__ == "__main__":
             logger.info("OS user isolation enabled (each bot runs as its own Unix user)")
         else:
             logger.warning("BOT_ISOLATION disabled: bots share the panel's user. Not zero-trust!")
+        # Start the Telegram relay FIRST so network isolation can open its ports
+        # and enforce REDIRECT. Single-shot: CA/certs generated once, listeners bound.
+        if tg_proxy is not None and tg_proxy.ensure():
+            logger.info(f"Telegram relay active -> {tg_proxy.UPSTREAM} "
+                        f"(proxy={tg_proxy.LISTEN_PORT}, transparent={tg_proxy.TRANS_LISTEN_PORT})")
+        else:
+            logger.warning("Telegram relay unavailable: bots keep direct api.telegram.org egress")
         # One-shot boot hardening: /proc masking + loopback network isolation.
         mount_hidepid()
         setup_network_isolation()

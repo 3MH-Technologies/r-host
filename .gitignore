@@ -8,3 +8,5 @@ USERS/
 test_*.py
 app_output.log
 app_error.log
+
+tgcert/
