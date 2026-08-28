@@ -89,8 +89,17 @@ def add_security_headers(response):
     return response
 
 
-ADMIN_USERNAME = os.environ.get("ADMIN_USER", "moh777")
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASS", "Mm@123456")
+# Sentinel: Admin credentials must come from the environment. Fail closed if they
+# are missing - a hardcoded fallback password is a critical auth bypass in a public
+# repo (anyone can read the default and log in as admin). Require explicit secrets.
+ADMIN_USERNAME = os.environ.get("ADMIN_USER")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASS")
+if not ADMIN_USERNAME or not ADMIN_PASSWORD:
+    logger.critical(
+        "FATAL: ADMIN_USER and ADMIN_PASS environment variables are required. "
+        "Refusing to start with unsecured admin credentials."
+    )
+    sys.exit(1)
 MAX_PROCESS_MEMORY_MB = int(os.environ.get("MAX_PROC_MEM_MB", 512))
 MAX_LOG_SIZE = 2 * 1024 * 1024
 
