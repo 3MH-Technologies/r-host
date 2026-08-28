@@ -223,6 +223,7 @@
     #editor-view { position: fixed; inset: 0; background: var(--bg); z-index: 2000; display: none; flex-direction: column; }
     .editor-top { padding: 16px 24px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; background: #0a0a0a; }
     .editor-area { flex: 1; background: #000; color: #d4d4d4; font-family: var(--mono); font-size: 14px; padding: 30px; border: none; outline: none; resize: none; line-height: 1.6; }
+    .editor-hint { position: absolute; bottom: 12px; left: 24px; z-index: 5; font-size: 12px; color: var(--text-dim); font-family: var(--mono); opacity: 0.85; pointer-events: none; }
 
     .toast-container { position: fixed; top: 80px; right: 24px; z-index: 9999; display: flex; flex-direction: column; gap: 10px; }
     .toast { background: rgba(20, 20, 25, 0.95); backdrop-filter: blur(20px); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 14px 20px; font-size: 13px; font-weight: 600; color: var(--text); animation: toastIn 0.3s ease, toastOut 0.3s ease 2.7s; max-width: 360px; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5); }
@@ -394,7 +395,8 @@
         <button class="btn" onclick="closeEditor()">CLOSE / إغلاق</button>
       </div>
     </div>
-    <textarea class="editor-area" id="ed-area" spellcheck="false"></textarea>
+    <textarea class="editor-area" id="ed-area" spellcheck="false" aria-label="Code editor"></textarea>
+    <div class="editor-hint">CTRL+S = save / حفظ · TAB = indent / إزاحة</div>
   </div>
 
   <div id="modalOverlay" class="modal-overlay">
@@ -646,6 +648,23 @@
       document.getElementById('editor-view').style.display = 'flex';
     }
     function closeEditor() { document.getElementById('editor-view').style.display = 'none'; }
+
+    const edArea = document.getElementById('ed-area');
+    edArea.addEventListener('keydown', (e) => {
+      // Ctrl/Cmd+S saves without leaving the editor
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
+        e.preventDefault();
+        saveFile();
+        return;
+      }
+      // Tab inserts two-space indent at the cursor instead of moving focus
+      if (e.key === 'Tab') {
+        e.preventDefault();
+        const { selectionStart: s, selectionEnd: en, value } = edArea;
+        edArea.value = value.slice(0, s) + '  ' + value.slice(en);
+        edArea.selectionStart = edArea.selectionEnd = s + 2;
+      }
+    });
     function toast(msg, type = 'info') {
       const box = document.getElementById('toastBox');
       const t = document.createElement('div');

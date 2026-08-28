@@ -490,10 +490,26 @@ def ensure_requirements_installed(owner, folder):
         return False
 
 
-def get_subprocess_env():
-    env = os.environ.copy()
+def get_subprocess_env(server_dir):
+    # Isolation: bots get a minimal env, NOT the host's (which contains secrets
+    # like ADMIN_PASS / PANEL_SECRET_KEY). Only pass platform-agnostic vars plus
+    # anything the owner defines in their own .env file.
+    env = {}
+    for k in ("PATH", "HOME", "TZ", "LANG", "LC_ALL", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"):
+        if k in os.environ:
+            env[k] = os.environ[k]
     env['PYTHONUNBUFFERED'] = '1'
     env['PYTHONDONTWRITEBYTECODE'] = '1'
+
+    env_path = os.path.join(server_dir, ".env")
+    if os.path.isfile(env_path):
+        with open(env_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                env[key.strip()] = val.strip()
     return env
 
 
@@ -622,7 +638,7 @@ def start_with_autoinstall(owner, folder, startup_file):
             cwd=server_dir,
             stdout=log_file,
             stderr=log_file,
-            env=get_subprocess_env(),
+            env=get_subprocess_env(server_dir),
         )
     else:
         wrapper_code = WRAPPER_TEMPLATE.format(base_dir=BASE_DIR)
@@ -631,7 +647,7 @@ def start_with_autoinstall(owner, folder, startup_file):
             cwd=server_dir,
             stdout=log_file,
             stderr=log_file,
-            env=get_subprocess_env(),
+            env=get_subprocess_env(server_dir),
         )
     return proc, log_file
 
