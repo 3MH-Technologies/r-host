@@ -1,12 +1,3 @@
----
-title: hostbot
-emoji: 🐳
-colorFrom: blue
-colorTo: indigo
-sdk: docker
-pinned: false
----
-
 # 🐺 White Wolf — Bot Hosting Platform
 
 منصة استضافة بوتات التلجرام | Telegram bot hosting platform with a web panel, file manager, console, and AI assistant.
@@ -17,16 +8,17 @@ pinned: false
 
 ## ✨ Features / المميزات
 
-- **Bot hosting** — تشغيل سكربتات البوتات (Python / PHP) مع إعادة تشغيل تلقائية عند الموت
-- **Auto-install** — تثبيت تلقائي لـ `requirements.txt` ومكتبات الاستيراد الناقصة
-- **Starter system** — تشغيل `main.py` أو أي ملف بداية تحددّه
-- **File manager** — مدير ملفات كامل (رفع، تنزيل، تعديل، إنشاء، حذف، إعادة تسمية)
+- **Bot hosting** — تشغيل سكربتات البوتات (Python / PHP) مع إعادة تشغيل تلقائية عند توقف العملية
+- **Auto-install** — تثبيت تلقائي لـ `requirements.txt` ولأي مكتبة استيراد ناقصة عند التشغيل
+- **Starter system** — تشغيل أي ملف بداية تحدده (افتراضياً `main.py`)
+- **File manager** — مدير ملفات (رفع، تعديل، إنشاء، حذف، إعادة تسمية) مع محرر أكواد مدمج
 - **Live console** — لوحة تحكم مباشرة تعرض الـ logs كل ثانيتين
-- **AI assistant** — مساعد ذكي مدمج للمساعدة في الأكواد (حد يومي للمستخدمين)
-- **Admin panel** — لوحة تحكم كاملة (مستخدمين، خطط، حظر، إحصائيات)
-- **Plans** — خطط: Free / Pro / Enterprise (حد البوتات والذاكرة والمساحة)
-- **Keep-alive** — فحص تلقائي للعملية وإعادة تشغيلها إذا توقفت
+- **AI assistant** — مساعد ذكي مدمج لمساعدة المستخدمين في الأكواد (حد يومي)
+- **Admin panel** — لوحة أدمن (إدارة مستخدمين، خطط، حظر، إحصائيات النظام)
+- **Plans** — خطط Free / Pro / Enterprise (حدود البوتات، الذاكرة، والمساحة)
+- **Keep-alive** — فحص دوري وإعادة تشغيل تلقائية للبوتات المتوقفة
 - **Log cleaner** — قص تلقائي للسجلات الكبيرة (2MB)
+- **Resource limits** — حد للذاكرة لكل بوت وحد للمساحة لكل حساب (يُرصد دورياً)
 
 ---
 
@@ -89,7 +81,7 @@ docker run -p 7860:7860 \
 ```
 app.py          # Flask backend + API + إدارة العمليات
 pinger.py       # Keep-alive منفصل (تُشغَّل كعملية مستقلة)
-dns_fix.py      # إصلاح DNS قبل تشغيل السكربتات
+dns_fix.py      # إصلاح DNS قبل تشغيل سكربتات المستخدمين
 Dockerfile      # صورة Docker للإنتاج
 index.html      # لوحة التحكم (dashboard)
 login.html      # تسجيل الدخول
@@ -103,11 +95,12 @@ USERS/          # سيرفرات المستخدمين
 
 ## 🛡️ Security Notes / ملاحظات أمنية
 
-- كلمات المرور مشفّرة بـ `werkzeug` (bcrypt).
+- كلمات المرور مشفّرة عبر `werkzeug security` (hash آمن).
 - عزل المسارات مضمون (`safe_join_server_path`) — لا يمكن الوصول لملفات خارج مجلد البوت.
-- Rate limiting على نقاط الحساسة (تسجيل الدخول، التسجيل، الأفعال).
-- جلسات cookies مشفّرة بتوقيع المفتاح السري.
+- Rate limiting على نقاط الحساسة (تسجيل الدخول، التسجيل، الأوامر).
+- جلسات cookies موقّعة بمفتاح سري (و تتم حمايتها عبر Secure/HttpOnly).
 - Headers أمنية على كل الردود (CSP, HSTS, X-Frame-Options…).
+- بيانات المتغيرات الحساسة تأتي من البيئة فقط — لا توجد بيانات اعتماد مكتوبة في الكود.
 
 ---
 
@@ -119,3 +112,7 @@ USERS/          # سيرفرات المستخدمين
 | `/login` | تسجيل الدخول |
 | `/admin` | لوحة الأدمن |
 | `/docs`, `/features`, `/terms`, `/privacy` | صفحات تعريفية |
+
+---
+
+**© 2026 3MH TECHNOLOGIES** — [3mh.pages.dev](https://3mh.pages.dev/) · جميع الحقوق محفوظة | All rights reserved
