@@ -10,3 +10,6 @@ app_output.log
 app_error.log
 
 tgcert/
+
+# Hugging Face Space staging (pushed to HF only, not GitHub)
+hf/
